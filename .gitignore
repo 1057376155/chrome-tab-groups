@@ -7,3 +7,8 @@ data/*.db-journal
 .DS_Store
 test_ui.py
 *.bak
+
+# pyinstaller build artifacts
+build/
+dist/
+*.spec

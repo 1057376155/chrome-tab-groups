@@ -293,3 +293,50 @@ def _empty_icon() -> "QIcon":
     from PyQt6.QtGui import QIcon
 
     return QIcon()
+
+
+def app_icon(size: int = 256) -> "QIcon":
+    """The application icon: stacked colored tab cards on a rounded tile.
+
+    Drawn programmatically (no image asset needed) so the project stays a
+    single Python package. The three cards echo Chrome's tab-group color
+    palette, hinting at the app's purpose (managing tab groups). Works at any
+    size; callers typically pass 256 for crisp Dock/title-bar rendering.
+    """
+    from PyQt6.QtCore import QRectF
+    from PyQt6.QtGui import QIcon
+
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    # Background rounded tile (soft neutral so the colored cards pop).
+    tile = QPainterPath()
+    margin = size * 0.04
+    tile.addRoundedRect(
+        QRectF(margin, margin, size - 2 * margin, size - 2 * margin),
+        size * 0.2, size * 0.2,
+    )
+    p.fillPath(tile, QColor(248, 249, 252))
+
+    # Three stacked tab cards, each rotated slightly for a fanned look.
+    # Colors mirror Chrome's tab group palette (blue/red/green).
+    cards = [QColor(66, 133, 244), QColor(234, 67, 53), QColor(52, 168, 83)]
+    card_w = size * 0.42
+    card_h = size * 0.54
+    cx, cy = size * 0.5, size * 0.54
+    for i, color in enumerate(cards):
+        p.setBrush(color)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.save()
+        p.translate(cx, cy)
+        p.rotate(-18 + i * 18)  # fan: -18°, 0°, +18°
+        p.drawRoundedRect(
+            QRectF(-card_w / 2, -card_h / 2, card_w, card_h),
+            size * 0.06, size * 0.06,
+        )
+        p.restore()
+
+    p.end()
+    return QIcon(pix)

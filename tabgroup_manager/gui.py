@@ -35,6 +35,7 @@ from .config import BRIDGE_URL, DB_PATH
 from .db import Database
 from .style import (
     APP_STYLESHEET,
+    app_icon,
     COLOR_LIGHT_BG,
     COLOR_QCOLORS,
     DARK_TEXT,
@@ -881,6 +882,9 @@ def run() -> None:
     app = QApplication([])
     # Native platform style (no custom stylesheet). See gui.py run().
     app.setApplicationName("Chrome Tab Group Manager")
+    # Set the app icon so the macOS Dock (and window title bar) show our
+    # branded icon instead of the generic Python interpreter icon.
+    app.setWindowIcon(app_icon(256))
     app.setFont(QFont("SF Pro Text", 13) if sys.platform == "darwin" else QFont("Segoe UI", 13))
     window = MainWindow()
     window.show()
