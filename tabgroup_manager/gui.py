@@ -31,7 +31,15 @@ from .bridge import Bridge
 from .chrome_opener import open_url, open_urls
 from .config import BRIDGE_URL, DB_PATH
 from .db import Database
-from .style import APP_STYLESHEET, COLOR_LIGHT_BG, COLOR_QCOLORS, DARK_TEXT, group_icon
+from .style import (
+    APP_STYLESHEET,
+    COLOR_LIGHT_BG,
+    COLOR_QCOLORS,
+    DARK_TEXT,
+    FaviconLoader,
+    group_icon,
+    url_title,
+)
 
 
 class WorkerSignals(QObject):
@@ -82,6 +90,7 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
 
+        self.favicons = FaviconLoader()
         self.bridge = Bridge(self.db)
         self.bridge.signals.snapshot_received.connect(self.on_snapshot_received)
         self.bridge.signals.restore_ack.connect(self.on_restore_ack)
@@ -115,8 +124,14 @@ class MainWindow(QMainWindow):
         self.tree.setHeaderLabels(["名称", "颜色 / 数量"])
         self.tree.setColumnCount(2)
         self.tree.setAlternatingRowColors(True)
+        # Hide the secondary column entirely — the left tree shows titles only.
+        # Secondary info (group tab counts, profile_dir) was cluttering the
+        # narrow left pane; the right-side detail panel already covers it.
+        self.tree.setHeaderHidden(True)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.tree.header().setStretchLastSection(False)
+        self.tree.setColumnWidth(1, 0)
         self.tree.itemDoubleClicked.connect(self.on_tree_double_click)
         self.tree.itemSelectionChanged.connect(self.on_selection_changed)
         left_layout.addWidget(self.tree)
@@ -279,6 +294,39 @@ class MainWindow(QMainWindow):
                     for group in groups:
                         self._add_group_item(snap_item, group, snap.id)
 
+    def _load_favicon(self, item: QTreeWidgetItem, url: str) -> None:
+        """Attach the site favicon to a tree item asynchronously.
+
+        Runs entirely on the Qt main thread: FaviconLoader uses
+        QNetworkAccessManager whose ``finished`` signal is delivered on the
+        main thread, so setIcon is always safe. If the tree was rebuilt (item
+        invalidated) by the time the icon arrives, setIcon is a harmless
+        no-op on a detached item.
+        """
+        from urllib.parse import urlparse
+
+        try:
+            host = urlparse(url).netloc
+        except Exception:
+            host = ""
+        if not host:
+            return
+        # Capture the row's URL so we can verify the item still represents it
+        # when the callback fires (tree rebuilds reuse widget memory).
+        def _apply(icon):
+            try:
+                # TreeWidgetItemWeakRef is overkill; just check it's still
+                # bound to this url. An item reused after a rebuild will have
+                # a different url, so we skip to avoid wrong icons.
+                data = item.data(0, Qt.ItemDataRole.UserRole) or {}
+                if data.get("url") == url:
+                    item.setIcon(0, icon)
+            except RuntimeError:
+                # Item was already garbage-collected (C++ side deleted).
+                pass
+
+        self.favicons.get(host, _apply)
+
     def _add_group_item(self, parent: QTreeWidgetItem, group, snapshot_id: int) -> None:
         """Append a group node (with its tabs) under ``parent``."""
         group_item = QTreeWidgetItem(parent)
@@ -312,8 +360,11 @@ class MainWindow(QMainWindow):
 
         for tab in tabs:
             tab_item = QTreeWidgetItem(group_item)
-            tab_item.setText(0, tab.title or tab.url)
-            tab_item.setText(1, tab.url)
+            tab_item.setText(0, url_title(tab.url, tab.title))
+            # Left tree: title only. The URL belongs in the right-side detail
+            # panel, where there's room to read it; duplicating it in column 1
+            # here just clutters the tree.
+            tab_item.setText(1, "")
             tab_item.setData(
                 0,
                 Qt.ItemDataRole.UserRole,
@@ -323,6 +374,10 @@ class MainWindow(QMainWindow):
                     "url": tab.url,
                 },
             )
+            # Fetch the favicon asynchronously and apply it once loaded.
+            # Callback captures tab_item by reference; if the item was removed
+            # (tree rebuilt) by the time the icon arrives, setIcon is a no-op.
+            self._load_favicon(tab_item, tab.url)
 
     def on_selection_changed(self) -> None:
         items = self.tree.selectedItems()
@@ -354,9 +409,10 @@ class MainWindow(QMainWindow):
             )
             for tab in tabs:
                 row = QTreeWidgetItem(self.detail_list)
-                row.setText(0, tab.title or tab.url)
+                row.setText(0, url_title(tab.url, tab.title))
                 row.setText(1, tab.url)
                 row.setData(0, Qt.ItemDataRole.UserRole, {"type": "tab", "url": tab.url})
+                self._load_favicon(row, tab.url)
         elif node_type == "window":
             win_id = data["id"]
             groups = self.db.get_groups_by_window(win_id)
