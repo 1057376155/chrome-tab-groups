@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "TabGroupManager Bridge",
+  "version": "0.1.0",
+  "description": "Bridge between the TabGroupManager desktop app and Chrome tab groups.",
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "windows",
+    "alarms",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "TabGroupManager",
+    "default_popup": "popup.html"
+  },
+}
