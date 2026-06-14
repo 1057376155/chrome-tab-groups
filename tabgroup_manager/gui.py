@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QToolBar,
     QTreeWidget,
     QTreeWidgetItem,
@@ -115,26 +116,26 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
-        # Left: tree
+        # Left: tabbed tree (Current / History)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
 
-        self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(["名称", "颜色 / 数量"])
-        self.tree.setColumnCount(2)
-        self.tree.setAlternatingRowColors(True)
-        # Hide the secondary column entirely — the left tree shows titles only.
-        # Secondary info (group tab counts, profile_dir) was cluttering the
-        # narrow left pane; the right-side detail panel already covers it.
-        self.tree.setHeaderHidden(True)
-        self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self.tree.header().setStretchLastSection(False)
-        self.tree.setColumnWidth(1, 0)
-        self.tree.itemDoubleClicked.connect(self.on_tree_double_click)
-        self.tree.itemSelectionChanged.connect(self.on_selection_changed)
-        left_layout.addWidget(self.tree)
+        # Two trees wrapped in a QTabWidget so scanned/captured snapshots
+        # (Current) and manually-saved windows (History) are kept separate.
+        # Both trees share the same callbacks; get_selected_node() reads the
+        # currently-active tab so all toolbar actions work on whichever view
+        # the user is looking at.
+        self.tabs = QTabWidget()
+        self.tree_current = self._make_tree()
+        self.tree_saved = self._make_tree()
+        self.tabs.addTab(self.tree_current, "当前")
+        self.tabs.addTab(self.tree_saved, "历史")
+        # Switching tabs clears the selection in the tree we're leaving, which
+        # fires itemSelectionChanged — guard against it clearing the detail
+        # panel by re-reading the new tab's selection.
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+        left_layout.addWidget(self.tabs)
 
         # Right: details
         right_widget = QWidget()
@@ -218,7 +219,8 @@ class MainWindow(QMainWindow):
 
     def on_snapshot_received(self, snapshot_id: int) -> None:
         self.log_status(f"收到并保存快照 #{snapshot_id}")
-        self.refresh_tree()
+        # Live captures land in the Current tab; don't touch the History tab.
+        self._refresh_current()
 
     def on_restore_ack(self, command_id: str, success: bool, message: str) -> None:
         msg = f"恢复成功: {message}" if success else f"恢复失败: {message}"
@@ -229,70 +231,156 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Tree & data helpers
     # ------------------------------------------------------------------
+    def _make_tree(self) -> QTreeWidget:
+        """Build a configured tree widget shared by the Current/History tabs.
+
+        Both trees get the same column setup, signals, and alternating-row
+        styling; only their data source differs (see _refresh_current /
+        _refresh_saved).
+        """
+        tree = QTreeWidget()
+        tree.setHeaderLabels(["名称", "颜色 / 数量"])
+        tree.setColumnCount(2)
+        tree.setAlternatingRowColors(True)
+        # Hide the secondary column — the left trees show titles only.
+        tree.setHeaderHidden(True)
+        tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        tree.header().setStretchLastSection(False)
+        tree.setColumnWidth(1, 0)
+        tree.itemDoubleClicked.connect(self.on_tree_double_click)
+        tree.itemSelectionChanged.connect(self.on_selection_changed)
+        return tree
+
+    @property
+    def tree(self) -> QTreeWidget:
+        """The currently-active tree (Current or History tab).
+
+        Kept as a property so the many places that historically referenced
+        self.tree keep working transparently — they always operate on
+        whichever tab is visible.
+        """
+        return self.tabs.currentWidget()
+
+    def _on_tab_changed(self, _index: int) -> None:
+        """When the user switches tabs, refresh the detail panel from the
+        newly-active tree's current selection (or clear it if none)."""
+        tree = self.tabs.currentWidget()
+        items = tree.selectedItems() if tree is not None else []
+        if items:
+            data = items[0].data(0, Qt.ItemDataRole.UserRole) or {}
+            self.update_detail_panel(data)
+        else:
+            self.detail_list.clear()
+            self.detail_label.setText("选择一个标签组或标签页查看详情")
+
     def refresh_tree(self) -> None:
-        self.tree.clear()
-        profiles = self.db.get_profiles()
-        for profile in profiles:
-            profile_item = QTreeWidgetItem(self.tree)
-            profile_item.setText(0, profile.name)
-            profile_item.setText(1, profile.profile_dir)
-            profile_item.setData(
-                0, Qt.ItemDataRole.UserRole, {"type": "profile", "id": profile.id}
+        """Refresh both the Current and History trees."""
+        self._refresh_current()
+        self._refresh_saved()
+
+    def _refresh_current(self) -> None:
+        """Populate the Current tab with scanned/captured snapshots.
+
+        Shows non-saved profiles and their non-saved snapshots. Signals are
+        blocked during the rebuild so itemSelectionChanged doesn't fire
+        spuriously while items are being added/removed.
+        """
+        tree = self.tree_current
+        tree.blockSignals(True)
+        tree.clear()
+        for profile in self.db.get_profiles(exclude_saved=True):
+            self._populate_profile(tree, profile, saved_only=False)
+        tree.blockSignals(False)
+
+    def _refresh_saved(self) -> None:
+        """Populate the History tab with manually-saved windows."""
+        tree = self.tree_saved
+        tree.blockSignals(True)
+        tree.clear()
+        for profile in self.db.get_saved_profiles():
+            self._populate_profile(tree, profile, saved_only=True)
+        tree.blockSignals(False)
+
+    def _populate_profile(
+        self,
+        parent: QTreeWidget,
+        profile,
+        saved_only: bool,
+    ) -> None:
+        """Render one profile and its snapshots under ``parent``.
+
+        ``saved_only=True`` pulls source='saved' snapshots (History tab);
+        ``False`` pulls everything that isn't 'saved' (Current tab).
+        """
+        profile_item = QTreeWidgetItem(parent)
+        profile_item.setText(0, profile.name)
+        profile_item.setText(1, profile.profile_dir)
+        profile_item.setData(
+            0,
+            Qt.ItemDataRole.UserRole,
+            {"type": "profile", "id": profile.id},
+        )
+        profile_font = QFont(profile_item.font(0))
+        profile_font.setBold(True)
+        profile_font.setPointSize(profile_font.pointSize() + 1)
+        profile_item.setFont(0, profile_font)
+        profile_item.setExpanded(True)
+
+        if saved_only:
+            snaps = self.db.get_snapshots(profile.id, source="saved")
+        else:
+            snaps = [
+                s for s in self.db.get_snapshots(profile.id)
+                if s.source != "saved"
+            ]
+
+        for snap in snaps:
+            snap_item = QTreeWidgetItem(profile_item)
+            snap_item.setText(
+                0,
+                f"{snap.created_at.strftime('%Y-%m-%d %H:%M:%S')} [{snap.source}]",
             )
-            profile_font = QFont(profile_item.font(0))
-            profile_font.setBold(True)
-            profile_font.setPointSize(profile_font.pointSize() + 1)
-            profile_item.setFont(0, profile_font)
-            profile_item.setExpanded(True)
+            snap_item.setText(1, "")
+            snap_item.setData(
+                0,
+                Qt.ItemDataRole.UserRole,
+                {"type": "snapshot", "id": snap.id},
+            )
+            snap_font = QFont(snap_item.font(0))
+            snap_font.setItalic(True)
+            snap_item.setFont(0, snap_font)
+            snap_item.setForeground(0, QColor(116, 125, 140))
+            snap_item.setExpanded(True)
 
-            snapshots = self.db.get_snapshots(profile.id)
-            for snap in snapshots:
-                snap_item = QTreeWidgetItem(profile_item)
-                snap_item.setText(
-                    0,
-                    f"{snap.created_at.strftime('%Y-%m-%d %H:%M:%S')} [{snap.source}]",
-                )
-                snap_item.setText(1, "")
-                snap_item.setData(
-                    0, Qt.ItemDataRole.UserRole, {"type": "snapshot", "id": snap.id}
-                )
-                snap_font = QFont(snap_item.font(0))
-                snap_font.setItalic(True)
-                snap_item.setFont(0, snap_font)
-                snap_item.setForeground(0, QColor(116, 125, 140))
-                snap_item.setExpanded(True)
+            groups = self.db.get_groups(snap.id)
+            windows = self.db.get_windows(snap.id)
 
-                groups = self.db.get_groups(snap.id)
-                windows = self.db.get_windows(snap.id)
-
-                if windows:
-                    # New data: profile → snapshot → window → group → tab.
-                    groups_by_window: Dict[Any, List] = {}
-                    for g in groups:
-                        groups_by_window.setdefault(g.window_id, []).append(g)
-                    for w in windows:
-                        win_item = QTreeWidgetItem(snap_item)
-                        w_groups = groups_by_window.get(w.id, [])
-                        w_tabs = sum(len(self.db.get_tabs(g.id)) for g in w_groups)
-                        win_item.setText(0, f"{w.title}  ({len(w_groups)} 组, {w_tabs} 标签)")
-                        win_item.setText(1, "")
-                        win_item.setData(
-                            0,
-                            Qt.ItemDataRole.UserRole,
-                            {"type": "window", "id": w.id, "snapshot_id": snap.id, "title": w.title},
-                        )
-                        win_font = QFont(win_item.font(0))
-                        win_font.setBold(True)
-                        win_item.setFont(0, win_font)
-                        win_item.setForeground(0, QColor(60, 90, 160))
-                        win_item.setExpanded(True)
-                        for group in w_groups:
-                            self._add_group_item(win_item, group, snap.id)
-                else:
-                    # Legacy data (no window rows): keep old shape so existing
-                    # snapshots still render correctly after the migration.
-                    for group in groups:
-                        self._add_group_item(snap_item, group, snap.id)
+            if windows:
+                groups_by_window: Dict[Any, List] = {}
+                for g in groups:
+                    groups_by_window.setdefault(g.window_id, []).append(g)
+                for w in windows:
+                    win_item = QTreeWidgetItem(snap_item)
+                    w_groups = groups_by_window.get(w.id, [])
+                    w_tabs = sum(len(self.db.get_tabs(g.id)) for g in w_groups)
+                    win_item.setText(0, f"{w.title}  ({len(w_groups)} 组, {w_tabs} 标签)")
+                    win_item.setText(1, "")
+                    win_item.setData(
+                        0,
+                        Qt.ItemDataRole.UserRole,
+                        {"type": "window", "id": w.id, "snapshot_id": snap.id, "title": w.title},
+                    )
+                    win_font = QFont(win_item.font(0))
+                    win_font.setBold(True)
+                    win_item.setFont(0, win_font)
+                    win_item.setForeground(0, QColor(60, 90, 160))
+                    win_item.setExpanded(True)
+                    for group in w_groups:
+                        self._add_group_item(win_item, group, snap.id)
+            else:
+                for group in groups:
+                    self._add_group_item(snap_item, group, snap.id)
 
     def _load_favicon(self, item: QTreeWidgetItem, url: str) -> None:
         """Attach the site favicon to a tree item asynchronously.
@@ -380,9 +468,18 @@ class MainWindow(QMainWindow):
             self._load_favicon(tab_item, tab.url)
 
     def on_selection_changed(self) -> None:
-        items = self.tree.selectedItems()
+        # The signal can come from either the Current or History tree. Prefer
+        # the actual sender so we read the right tree even if the active tab
+        # differs (e.g. a programmatic selection change in the background tree).
+        sender = self.sender()
+        tree = sender if isinstance(sender, QTreeWidget) else self.tree
+        # Ignore selection changes from a tree that isn't the active tab —
+        # otherwise clearing a background tree during refresh would wipe the
+        # detail panel the user is currently looking at.
+        if tree is not self.tree:
+            return
+        items = tree.selectedItems()
         if not items:
-            # No selection — reset detail panel to default state.
             self.detail_list.clear()
             self.detail_label.setText("选择一个标签组或标签页查看详情")
             return
@@ -532,7 +629,7 @@ class MainWindow(QMainWindow):
             self.db.import_snapshot(
                 r["profile_dir"], r["profile_name"], r["email"], groups, source="snss"
             )
-        self.refresh_tree()
+        self._refresh_current()
         self.log_status(
             f"扫描完成: {len(results)} profiles, {total_groups} groups, {total_tabs} tabs"
         )
@@ -632,8 +729,12 @@ class MainWindow(QMainWindow):
         if new_sid is None:
             QMessageBox.information(self, "无法保存", "该窗口没有可保存的标签。")
             return
-        self.refresh_tree()
-        self.log_status(f"已保存窗口「{win.title}」到 ⭐已保存窗口")
+        # Only the History tree changes (the saved snapshot lands there);
+        # refreshing just it preserves the Current tab's expand/scroll state.
+        self._refresh_saved()
+        # Jump to the History tab so the user immediately sees the result.
+        self.tabs.setCurrentWidget(self.tree_saved)
+        self.log_status(f"已保存窗口「{win.title}」到历史")
 
     def open_window_by_id(self, window_id: int) -> None:
         groups = self.db.get_groups_by_window(window_id)

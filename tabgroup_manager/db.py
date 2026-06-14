@@ -343,33 +343,71 @@ class Database:
             conn.commit()
         return snapshot_id
 
-    def get_profiles(self) -> List[Profile]:
-        conn = self._connect()
-        cur = conn.execute(
-            "SELECT id, profile_dir, name, email, created_at FROM profiles ORDER BY name"
-        )
-        return [Profile(**dict(row)) for row in cur.fetchall()]
+    def get_profiles(self, exclude_saved: bool = False) -> List[Profile]:
+        """Return all profiles.
 
-    def get_snapshots(self, profile_id: Optional[int] = None) -> List[Snapshot]:
+        With ``exclude_saved=True``, profiles created by "save window" (whose
+        profile_dir starts with the ``__saved__/`` prefix) are filtered out —
+        those belong to the History tab, not the Current tab.
+        """
         conn = self._connect()
-        if profile_id is None:
+        if exclude_saved:
+            # substr() prefix match avoids LIKE's wildcard semantics (where
+            # '_' matches any char) — we want a literal "__saved__/" prefix.
             cur = conn.execute(
-                """SELECT s.id, s.profile_id, s.source, s.created_at,
-                          p.profile_dir, p.name AS profile_name
-                   FROM snapshots s
-                   JOIN profiles p ON p.id = s.profile_id
-                   ORDER BY s.created_at DESC"""
+                """SELECT id, profile_dir, name, email, created_at
+                   FROM profiles
+                   WHERE substr(profile_dir, 1, 10) != '__saved__/'
+                   ORDER BY name"""
             )
         else:
             cur = conn.execute(
-                """SELECT s.id, s.profile_id, s.source, s.created_at,
-                          p.profile_dir, p.name AS profile_name
-                   FROM snapshots s
-                   JOIN profiles p ON p.id = s.profile_id
-                   WHERE s.profile_id = ?
-                   ORDER BY s.created_at DESC""",
-                (profile_id,),
+                "SELECT id, profile_dir, name, email, created_at FROM profiles ORDER BY name"
             )
+        return [Profile(**dict(row)) for row in cur.fetchall()]
+
+    def get_saved_profiles(self) -> List[Profile]:
+        """Return only the synthetic profiles created by "save window"."""
+        conn = self._connect()
+        cur = conn.execute(
+            """SELECT id, profile_dir, name, email, created_at
+               FROM profiles
+               WHERE substr(profile_dir, 1, 10) = '__saved__/'
+               ORDER BY name"""
+        )
+        return [Profile(**dict(row)) for row in cur.fetchall()]
+
+    def get_snapshots(
+        self,
+        profile_id: Optional[int] = None,
+        source: Optional[str] = None,
+    ) -> List[Snapshot]:
+        """Return snapshots, optionally filtered by profile and/or source.
+
+        ``source`` accepts a single value (e.g. 'saved'); pass
+        ``source='saved'`` for the History tab, or filter on the caller side
+        for "not saved" (current snapshots). When ``profile_id`` is given,
+        results are scoped to that profile.
+        """
+        conn = self._connect()
+        clauses = []
+        params: list = []
+        if profile_id is not None:
+            clauses.append("s.profile_id = ?")
+            params.append(profile_id)
+        if source is not None:
+            clauses.append("s.source = ?")
+            params.append(source)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cur = conn.execute(
+            f"""SELECT s.id, s.profile_id, s.source, s.created_at,
+                       p.profile_dir, p.name AS profile_name
+                FROM snapshots s
+                JOIN profiles p ON p.id = s.profile_id
+                {where}
+                ORDER BY s.created_at DESC""",
+            params,
+        )
         return [
             Snapshot(
                 id=row["id"],
