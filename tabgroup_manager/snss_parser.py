@@ -270,9 +270,13 @@ def scan_profile(profile_dir: str, profile_info: Optional[Dict] = None) -> List[
         return []
 
     results: List[Dict] = []
+    # Sort by the Chrome-epoch timestamp in the filename, newest first. File
+    # size is misleading (older snapshots can be larger) and filesystem mtime
+    # lags; the filename timestamp reflects when Chrome actually wrote it, so
+    # the newest file holds the set of windows that are currently open.
     session_files = sorted(
         [f for f in sessions_dir.iterdir() if f.name.startswith("Session_")],
-        key=lambda f: f.stat().st_size,
+        key=lambda f: _ts_from_filename(f.name) or datetime.min,
         reverse=True,
     )
 
@@ -390,8 +394,30 @@ def deduplicate_groups(results: List[Dict]) -> List[Dict]:
             ):
                 best[key] = (group, r)
 
+    # ``results`` is ordered newest-session-first (see scan_profile). The
+    # newest file holds the windows that are currently open in Chrome; older
+    # files keep records of windows that have since been closed. Collect the
+    # set of window ids present in the newest file so we can drop closed
+    # windows instead of surfacing stale ones.
+    live_windows: set = set()
+    if results:
+        for g in results[0]["groups"].values():
+            wid = g.get("window_id")
+            if wid is not None:
+                live_windows.add(wid)
+    # If the newest file exposes no windows at all (older Chrome build, or the
+    # cmd 0/14 layout we rely on changed), fall back to "keep everything"
+    # rather than silently dropping all groups.
+    use_live_filter = bool(live_windows)
+
     groups_out = []
     for group, r in best.values():
+        wid = group.get("window_id")
+        # Drop groups whose window is not in the newest session file — those
+        # windows have been closed. Groups whose window could not be
+        # determined (wid is None) are always kept.
+        if use_live_filter and wid is not None and wid not in live_windows:
+            continue
         groups_out.append(
             {
                 "title": group["title"] or "(untitled)",
@@ -399,7 +425,7 @@ def deduplicate_groups(results: List[Dict]) -> List[Dict]:
                 "color_id": group["color_id"],
                 "collapsed": group["collapsed"],
                 "uuid": group["uuid"],
-                "window_id": group.get("window_id"),
+                "window_id": wid,
                 "tabs": group.get("tabs", []),
                 "session_file": r["file"],
                 "file_modified": r["file_modified"],
