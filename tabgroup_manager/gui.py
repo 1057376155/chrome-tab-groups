@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -116,10 +117,20 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
         main_layout.addWidget(splitter)
 
-        # Left: tabbed tree (Current / History)
+        # Left: search box + tabbed tree (Current / History)
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(4)
+
+        # Search box at the top of the left pane. Filters both trees as the
+        # user types — non-matching nodes are hidden, ancestors of matches are
+        # expanded, and matches are highlighted.
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("搜索标题或 URL…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._on_search_changed)
+        left_layout.addWidget(self.search_edit)
 
         # Two trees wrapped in a QTabWidget so scanned/captured snapshots
         # (Current) and manually-saved windows (History) are kept separate.
@@ -274,10 +285,88 @@ class MainWindow(QMainWindow):
             self.detail_list.clear()
             self.detail_label.setText("选择一个标签组或标签页查看详情")
 
+    # ------------------------------------------------------------------
+    # Search / filter
+    # ------------------------------------------------------------------
+    def _on_search_changed(self, text: str) -> None:
+        """Filter both trees by the search box content.
+
+        Matching is case-insensitive against the node's title (column 0) and,
+        for tab nodes, the URL stored in UserRole. When the query is empty,
+        all nodes are shown again with highlighting cleared.
+        """
+        query = text.strip().lower()
+        self._apply_filter(self.tree_current, query)
+        self._apply_filter(self.tree_saved, query)
+
+    def _apply_filter(self, tree: QTreeWidget, query: str) -> None:
+        """Hide non-matching nodes in ``tree``; expand the ancestor chain of
+        any match so it stays visible; highlight matches.
+
+        Returns True if a subtree contains a match (so the caller can keep
+        its parent visible). A node matches if its own title/url matches OR
+        any of its descendants match — that way a profile/snapshot/window that
+        contains a matching tab is shown with the path expanded down to it.
+        """
+        highlight = QColor(255, 248, 176)  # pale yellow
+        no_highlight = QColor(0, 0, 0, 0)  # transparent (clears highlight)
+
+        tree.blockSignals(True)
+        try:
+            if not query:
+                # Reset: show everything, clear highlights, collapse back to
+                # the natural expanded state (profile/snapshot/window expanded).
+                self._reset_filter(tree, tree.invisibleRootItem())
+                return
+
+            self._filter_recursive(tree.invisibleRootItem(), query, highlight, no_highlight)
+        finally:
+            tree.blockSignals(False)
+
+    def _filter_recursive(self, item, query: str, highlight, no_highlight) -> bool:
+        """Recursively filter ``item``'s children. Returns True if any node
+        in this subtree matches the query."""
+        any_match = False
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child_match = self._filter_recursive(child, query, highlight, no_highlight)
+
+            # A node matches on its own title/url, or if a descendant matches.
+            data = child.data(0, Qt.ItemDataRole.UserRole) or {}
+            title = (child.text(0) or "").lower()
+            url = (data.get("url") or "").lower()
+            self_match = query in title or query in url
+            matched = self_match or child_match
+
+            # Show/hide: hide only if neither this node nor any descendant
+            # matches. Hidden nodes don't need highlight work.
+            child.setHidden(not matched)
+            if self_match:
+                child.setBackground(0, highlight)
+            else:
+                child.setBackground(0, no_highlight)
+
+            # If something in this subtree matched, expand ancestors so the
+            # match is reachable.
+            if matched:
+                any_match = True
+                item.setExpanded(True)
+        return any_match
+
+    def _reset_filter(self, tree, item) -> None:
+        """Clear all filtering: un-hide everything, clear highlights."""
+        for i in range(item.childCount()):
+            child = item.child(i)
+            child.setHidden(False)
+            child.setBackground(0, QColor(0, 0, 0, 0))
+            self._reset_filter(tree, child)
+
     def refresh_tree(self) -> None:
         """Refresh both the Current and History trees."""
         self._refresh_current()
         self._refresh_saved()
+        # Re-apply the current search filter to the freshly rebuilt trees.
+        self._on_search_changed(self.search_edit.text())
 
     def _refresh_current(self) -> None:
         """Populate the Current tab with scanned/captured snapshots.
